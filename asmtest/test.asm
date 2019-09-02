@@ -24,19 +24,17 @@ section .text
 
 	global main
 	main:
-		; mov rbx, memory
-		; add rbx, $15000
+		mov rbx, memory
+		add rbx, $15000
 
-		; mov rcx, iobuffer
+		mov rcx, iobuffer
 
 		nop
 		nop
 		nop
 		nop
 
-		mov al, byte[rbx]
-		mov byte[rbx], 0
-		sub byte[rbx+300], al
+		inc byte [rbx+300]
 
 		nop
 		nop

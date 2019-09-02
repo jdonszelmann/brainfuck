@@ -26,7 +26,7 @@ CMDARGS =
 
 # linker
 LFLAGS = 
-LIBRARIES =
+LIBRARIES = -lpthread
 
 # c
 CFLAGS = -g -O3 -Wall

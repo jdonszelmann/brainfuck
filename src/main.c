@@ -1,15 +1,26 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <time.h>
+#include <sys/time.h>
+#include <sys/resource.h>
 
 #define CODE_BUFFER_SIZE 400000
 #define TAPE_SIZE 30000
 #define LOOPSTACK_SIZE 256
 #define IO_SIZE 1000000
 
-#define WRITEPROGRAM 1
+// set to 1 to get a ~40% speed boost at the cost of some reliability
+// segfaults 50% of the time.
+#define FAST 1
+// the number of bytes that need to be compiled before the compiler can start running
+// the higher the safer (and slower)
+// some bytes might allways stay zero and will cause an infinite loop. 
+#define NUMBYTES 15000
 
 #define PLUS '+'
 #define MINUS '-'
@@ -32,9 +43,6 @@
 #define add_u16_to_pointer(pointer, u16) \
 	*(pointer++) = (uint8_t)(u32 & 0x00ff);\
 	*(pointer++) = (uint8_t)((u32 & 0xff00) >> 8 );\
-
-
-typedef void (*func_t)(void);
 
 uint8_t * executable_buffer(size_t size){
 	uint8_t *memory = mmap (NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -62,8 +70,8 @@ void compile(uint8_t * program, char * filename){
 
 	fclose(file);
 
-	char * result_iter = brainfuck_code;
-	for(char * iter = brainfuck_code; *iter != '\0'; iter++){
+	register char * result_iter = brainfuck_code;
+	for(register char * iter = brainfuck_code; *iter != '\0'; iter++){
 		switch(*iter){
 			case RIGHT:
 			case LEFT:
@@ -81,15 +89,20 @@ void compile(uint8_t * program, char * filename){
 	*result_iter = '\0';
 
 	// points to the current position in the program that's
-	// written to
+	// written to.
+	#if FAST
 	register uint8_t * programpointer = program;
+	#else
+	// Add one so the first byte stays a nop (in safe mode)
+	register uint8_t * programpointer = program + 1;
+	#endif
 
 	// stack for keeping track of loop jump locations
 	uint8_t ** loopstack = malloc(LOOPSTACK_SIZE * sizeof(uint8_t *));
-	uint16_t loopstackpointer = 0;
+	register uint16_t loopstackpointer = 0;
 
-	for(char * iter = brainfuck_code; *iter != '\0';){
-		char * count = iter;
+	for(register char * iter = brainfuck_code; *iter != '\0';){
+		register char * count = iter;
 
 		switch(*iter){
 			case RIGHT:;
@@ -106,10 +119,34 @@ void compile(uint8_t * program, char * filename){
 
 				break;
 			case LEFT:;
+				int leftcounter = 0;
 				while(*iter == LEFT){
 					iter++;
+					leftcounter++;
 				}
-				
+				if(*iter == PLUS){
+					char * tmpiter = iter+1;
+					int rightcounter = 0;
+
+					// char * string = malloc(45);
+					// memcpy(string, tmpiter-20, 40);
+					// string[40] = 0;
+					// printf("%s\n", string);
+
+					while(*tmpiter == RIGHT && rightcounter != leftcounter){
+						tmpiter++;
+						rightcounter++;
+					}
+					
+					if(rightcounter == leftcounter){
+						add_u8_to_pointer(programpointer, 0xfe);
+						add_u8_to_pointer(programpointer, 0x83);
+						add_u32_to_pointer(programpointer, -rightcounter);
+						iter = tmpiter;
+						break;
+					}
+				}
+
 				// add instruction prefix
 				add_u8_to_pointer(programpointer, 0x48);
 				add_u8_to_pointer(programpointer, 0x81);
@@ -288,32 +325,19 @@ void compile(uint8_t * program, char * filename){
 
 	// add return
 	add_u8_to_pointer(programpointer, 0xc3);
+
+	#if !FAST
+	// set the first byte to an actual nop instruction
+	add_u8_to_pointer(program, 0x90);
+	#endif
 }
 
-int main(int argc, char ** argv){
-	
-	// make STDOUT asynchronous
-	fcntl(1, F_SETFL, O_NONBLOCK);
+void sleep(unsigned long nsec) {
+    struct timespec delay = { nsec / 1000000000, nsec % 1000000000 };
+    pselect(0, NULL, NULL, NULL, &delay, NULL);
+}
 
-	// check if there is a filename as second argument
-	if(argc < 2){
-		printf("no filename found\n");
-		exit(-1);
-	}
-
-	// get the filename
-	char * filename = argv[1];
-	printf("running %s", filename);
-
-	// allocate an executable buffer
-	uint8_t * program = executable_buffer(CODE_BUFFER_SIZE);
-	if(program == NULL){
-		printf("couldn't allocate executable buffer\n");
-		exit(-1);
-	}
-
-	// compile the brainfuck to machine code
-	compile(program,filename);
+void * run(void * program){
 
 	// allocate a tape
 	uint8_t * tape = calloc(TAPE_SIZE, sizeof(uint8_t));
@@ -330,6 +354,19 @@ int main(int argc, char ** argv){
 	}
 	register uint64_t iopointer = (uint64_t)iobuffer;
 
+	#if FAST
+	// wait for the compiler to have written <NUMBYTES> bytes
+	while(((uint8_t *)program)[NUMBYTES] == 0){
+		sleep(200);
+	}
+	#else
+	// wait for the compiler to write it's first byte
+	while(((uint8_t *)program)[0] == 0){
+		sleep(20);
+	}
+	#endif
+
+	// run the buffer
 	asm volatile(
 		"mov %0, %%rax\n"
 		"mov %1, %%rbx\n"
@@ -337,18 +374,57 @@ int main(int argc, char ** argv){
 		"callq *%%rax\n"
 
 		:
-			"=m"(program),
+			"+r"(program),
 			"+r"(tapepointer),
 			"+r"(iopointer)
 		:
 		: 
-			"rax", // 
+			"rax", // GP
 			"rbx", // tape pointer
-			"rcx", // io buffer pointer
-			"rdx"  //
+			"rcx"  // io buffer pointer
 	);
 
 	printf("%s",iobuffer);
+
+	return NULL;
+}
+
+int main(int argc, char ** argv){
+	// make STDOUT asynchronous
+	fcntl(1, F_SETFL, O_NONBLOCK);
+
+	// check if there is a filename as second argument
+	if(argc < 2){
+		printf("no filename found\n");
+		exit(-1);
+	}
+
+	// get the filename
+	char * filename = argv[1];
+	printf("running %s\n", filename);
+
+	// allocate an executable buffer
+	uint8_t * program = executable_buffer(CODE_BUFFER_SIZE);
+	if(program == NULL){
+		printf("couldn't allocate executable buffer\n");
+		exit(-1);
+	}
+
+	// immediately start spawning a new thread cause it is slower than the compiler itself.
+	pthread_t thread;
+	int err = pthread_create(&thread, NULL, run, program);
+
+	if (err){
+		printf("Couldn't spawn thread\n");
+		exit(-1);
+	}
+
+	// compile the brainfuck to machine code
+	compile(program,filename);
+
+
+	pthread_join(thread, NULL);
+
 
 	return 0;
 }
